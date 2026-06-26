@@ -238,6 +238,7 @@ export default function TemplateDetailPage() {
         <TemplateTabs
           tab={tab as PpeTabKey}
           name={meta.name}
+          templateId={meta.id}
           content={TEMPLATE_CONTENT[meta.id]}
           stages={richStages}
           onStagesChange={(stages) => persist({ ...tpl, lifecycleStages: stages })}

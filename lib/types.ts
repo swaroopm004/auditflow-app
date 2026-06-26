@@ -350,6 +350,7 @@ export interface LifecycleLine {
   side: "Dr" | "Cr";
   glNo?: string;          // ledger GL number — flows into the Connected GLs tab
   emph?: string;          // small italic qualifier e.g. "if existing surplus"
+  amount?: string;        // posting amount (₹L) — editable; auto-filled from an uploaded supporting doc
 }
 
 /** A structured JE inside a lifecycle stage. Mirrors the HTML demo's

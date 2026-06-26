@@ -14,11 +14,25 @@
  * reviewer sign-off, which is owned by the parent page and passed in as props.
  */
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import type { LifecycleEntry, LifecycleLine, LifecycleStage, LifecycleTone } from "@/lib/types";
 import type { AcctType, AssertionDef, CheckDef, ConnectedDef, FrameworkDef, TemplateContent } from "@/lib/execution/template-content";
+import { supportingDocFor, type SupportingDocSpec } from "@/lib/execution/supporting-docs";
 import { uid } from "@/lib/utils";
+
+// Shape returned by POST /api/extract
+interface ExtractResult {
+  documentType: string;
+  period: string;
+  currency: string;
+  fields: { label: string; value: string }[];
+  lineAmounts: { lineId: string; account: string; amount: string }[];
+  connectedAmounts: { account: string; amount: string }[];
+  suggestedEntries: { title: string; narration: string; lines: { account: string; side: "Dr" | "Cr"; amount: string; glNo: string }[] }[];
+  notes: string;
+  confidence: "high" | "medium" | "low";
+}
 
 // ── HTML colour palette (CSS vars → constants) ─────────────────────────────
 const C = {
@@ -153,6 +167,7 @@ export type ConnData = Record<string, { amount?: string; classification?: string
 export function TemplateTabs({
   tab,
   name,
+  templateId,
   content,
   stages,
   onStagesChange,
@@ -168,6 +183,7 @@ export function TemplateTabs({
 }: {
   tab: PpeTabKey;
   name: string;
+  templateId: string;
   content: TemplateContent;
   stages: LifecycleStage[];
   onStagesChange: (next: LifecycleStage[]) => void;
@@ -198,7 +214,7 @@ export function TemplateTabs({
 
   return (
     <div style={{ fontFamily: "var(--font, 'DM Sans', sans-serif)" }}>
-      {tab === "entries" && <LifecycleTab stages={stages} onChange={onStagesChange} framework={content.framework} headChip={content.headChip} />}
+      {tab === "entries" && <LifecycleTab stages={stages} onChange={onStagesChange} framework={content.framework} headChip={content.headChip} templateId={templateId} glName={name} connectedAccounts={(content.connected?.accts ?? []).map((a) => a.name)} onSetConn={onSetConn} />}
       {tab === "depnDT" && content.hasDepnCalc && (
         <DepnTab register={register} setRegister={setRegister} taxRate={taxRate} setTaxRate={setTaxRate} totals={totals} />
       )}
@@ -215,7 +231,18 @@ export function TemplateTabs({
 // ════════════════════════════════════════════════════════════════════════════
 // TAB 1 — Lifecycle JEs
 // ════════════════════════════════════════════════════════════════════════════
-function LifecycleTab({ stages, onChange, framework, headChip }: { stages: LifecycleStage[]; onChange: (next: LifecycleStage[]) => void; framework: FrameworkDef; headChip: string }) {
+function LifecycleTab({
+  stages, onChange, framework, headChip, templateId, glName, connectedAccounts, onSetConn,
+}: {
+  stages: LifecycleStage[];
+  onChange: (next: LifecycleStage[]) => void;
+  framework: FrameworkDef;
+  headChip: string;
+  templateId: string;
+  glName: string;
+  connectedAccounts: string[];
+  onSetConn: (account: string, patch: { amount?: string; classification?: string }) => void;
+}) {
   const [active, setActive] = useState(stages[0]?.key ?? "purchase");
   const stage = stages.find((s) => s.key === active) ?? stages[0];
 
@@ -233,6 +260,41 @@ function LifecycleTab({ stages, onChange, framework, headChip }: { stages: Lifec
     mutStages((s) => ({ ...s, entries: [...s.entries, { id: uid("le"), entryRef: `Entry ${s.entries.length + 1}`, title: "New Journal Entry", tone: "ppe", note: "", lines: [{ id: uid("ll"), label: "", side: "Dr" }, { id: uid("ll"), label: "", side: "Cr" }] }] }));
   const removeEntry = (eid: string) => mutStages((s) => ({ ...s, entries: s.entries.filter((e) => e.id !== eid) }));
 
+  // ── supporting-document extraction (AI auto-fill) ─────────────────────────
+  const spec = supportingDocFor(templateId);
+  const allLines = useMemo(
+    () => stages.flatMap((s) => s.entries.flatMap((e) => e.lines.map((l) => ({ id: l.id, label: l.label, side: l.side })))),
+    [stages],
+  );
+
+  const applyExtraction = (data: ExtractResult) => {
+    // 1. posting amounts → patch matching lines across every stage
+    const amtById = new Map<string, string>();
+    for (const la of data.lineAmounts ?? []) if (la.amount?.trim()) amtById.set(la.lineId, la.amount.trim());
+    let next = stages;
+    if (amtById.size) {
+      next = next.map((s) => ({ ...s, entries: s.entries.map((e) => ({ ...e, lines: e.lines.map((l) => (amtById.has(l.id) ? { ...l, amount: amtById.get(l.id) } : l)) })) }));
+    }
+    // 2. document-evidenced entries → append to the active stage
+    if (data.suggestedEntries?.length) {
+      next = next.map((s) =>
+        s.key !== active ? s : {
+          ...s,
+          entries: [
+            ...s.entries,
+            ...data.suggestedEntries.map((se) => ({
+              id: uid("le"), entryRef: "AI ✦", title: se.title || "Extracted Entry", tone: "accent" as LifecycleTone, note: se.narration || "",
+              lines: (se.lines ?? []).map((ln) => ({ id: uid("ll"), label: ln.account, side: (ln.side === "Cr" ? "Cr" : "Dr") as "Dr" | "Cr", glNo: ln.glNo || "", amount: ln.amount || "" })),
+            })),
+          ],
+        },
+      );
+    }
+    if (next !== stages) onChange(next);
+    // 3. connected-GL amounts → feed the financial-statement AUTO column
+    for (const ca of data.connectedAmounts ?? []) if (ca.amount?.trim()) onSetConn(ca.account, { amount: ca.amount.trim() });
+  };
+
   return (
     <div>
       {/* heading */}
@@ -243,6 +305,18 @@ function LifecycleTab({ stages, onChange, framework, headChip }: { stages: Lifec
         </div>
         <Chip text={headChip} tone="ppe" />
       </div>
+
+      {/* supporting-document upload → AI extraction → auto-fill */}
+      {spec && (
+        <SupportingDocUpload
+          spec={spec}
+          glName={glName}
+          expects={spec.extracts}
+          lines={allLines}
+          accounts={connectedAccounts}
+          onApply={applyExtraction}
+        />
+      )}
 
       {/* framework banner */}
       <div style={{ background: `linear-gradient(135deg, ${C.ppeLt}, #F0FFF4)`, border: `1.5px solid ${C.ppeMed}`, borderRadius: 10, padding: "14px 16px", marginBottom: 18, display: "flex", gap: 14 }}>
@@ -288,6 +362,106 @@ function LifecycleTab({ stages, onChange, framework, headChip }: { stages: Lifec
           ＋ Add Journal Entry to “{stage?.label}” stage
         </button>
       </div>
+    </div>
+  );
+}
+
+// ── Supporting-document upload → Claude extraction → auto-fill ──────────────
+function SupportingDocUpload({
+  spec, glName, expects, lines, accounts, onApply,
+}: {
+  spec: SupportingDocSpec;
+  glName: string;
+  expects: string[];
+  lines: { id: string; label: string; side: string }[];
+  accounts: string[];
+  onApply: (data: ExtractResult) => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<{ fileName: string; data: ExtractResult } | null>(null);
+  const [drag, setDrag] = useState(false);
+
+  async function handleFile(file: File) {
+    setBusy(true); setError(null); setResult(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("glName", glName);
+      fd.append("expects", JSON.stringify(expects));
+      fd.append("lines", JSON.stringify(lines));
+      fd.append("accounts", JSON.stringify(accounts));
+      const res = await fetch("/api/extract", { method: "POST", body: fd });
+      const json = await res.json();
+      if (!res.ok || json.error) throw new Error(json.error || `Extraction failed (${res.status})`);
+      setResult({ fileName: json.fileName, data: json.data as ExtractResult });
+      onApply(json.data as ExtractResult);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Extraction failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const d = result?.data;
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div style={{ fontSize: 12.5, fontWeight: 700, color: C.text }}>{spec.icon} {spec.title}</div>
+      <div style={{ fontSize: 10.5, color: C.muted, marginTop: 4, marginBottom: 8 }}>Auto-extracts: {spec.extracts.join(" · ")}</div>
+
+      <div
+        onClick={() => !busy && inputRef.current?.click()}
+        onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
+        onDragLeave={() => setDrag(false)}
+        onDrop={(e) => { e.preventDefault(); setDrag(false); const f = e.dataTransfer.files?.[0]; if (f) handleFile(f); }}
+        style={{ border: `2px dashed ${drag ? C.accent : C.amberMed}`, background: drag ? C.accentLt : C.amberLt, borderRadius: 12, padding: "24px 20px", textAlign: "center", cursor: busy ? "default" : "pointer", transition: "all .15s" }}
+      >
+        <input ref={inputRef} type="file" accept={spec.accept} style={{ display: "none" }}
+          onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); e.currentTarget.value = ""; }} />
+        {busy ? (
+          <div style={{ color: C.accent, fontWeight: 700, fontSize: 13 }}>⏳ Reading document with Claude… this can take a few seconds.</div>
+        ) : (
+          <>
+            <div style={{ fontSize: 28 }}>{spec.icon}</div>
+            <div style={{ color: C.amber, fontWeight: 800, fontSize: 14, marginTop: 6 }}>Click to upload or drag &amp; drop</div>
+            <div style={{ fontSize: 11.5, color: C.text2, marginTop: 6 }}>{spec.docTypes}</div>
+            <div style={{ fontSize: 10.5, color: C.muted, marginTop: 4 }}>{spec.hint}</div>
+          </>
+        )}
+      </div>
+
+      {error && (
+        <div style={{ marginTop: 8, fontSize: 11.5, color: C.red, background: C.redLt, border: `1px solid ${C.redMed}`, borderRadius: 8, padding: "8px 10px" }}>⚠ {error}</div>
+      )}
+
+      {d && (
+        <div style={{ marginTop: 10, border: `1.5px solid ${C.ppeMed}`, background: C.ppeLt, borderRadius: 10, padding: "12px 14px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 12.5, fontWeight: 800, color: C.ppe }}>✓ Extracted from {result!.fileName} — applied to the journal entries</span>
+            <Chip text={`confidence: ${d.confidence}`} tone={d.confidence === "high" ? "green" : d.confidence === "low" ? "red" : "amber"} />
+          </div>
+          <div style={{ fontSize: 10.5, color: C.text2, marginTop: 4 }}>
+            {[d.documentType, d.period, d.currency].filter(Boolean).join(" · ")}
+          </div>
+          <div style={{ fontSize: 11, color: C.text2, marginTop: 8 }}>
+            Auto-filled <b>{d.lineAmounts.filter((l) => l.amount?.trim()).length}</b> posting amount(s) ·{" "}
+            <b>{d.connectedAmounts.filter((c) => c.amount?.trim()).length}</b> connected GL(s) ·{" "}
+            <b>{d.suggestedEntries.length}</b> suggested entry(ies) appended to this stage.
+          </div>
+          {d.fields?.length > 0 && (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))", gap: 8, marginTop: 10 }}>
+              {d.fields.map((f, i) => (
+                <div key={i} style={{ background: "#fff", border: `1px solid ${C.border}`, borderRadius: 8, padding: "7px 10px" }}>
+                  <div style={{ fontSize: 9.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".3px", color: C.muted }}>{f.label}</div>
+                  <div style={{ fontSize: 12.5, fontWeight: 600, color: f.value ? C.text : C.muted, marginTop: 2 }}>{f.value || "—"}</div>
+                </div>
+              ))}
+            </div>
+          )}
+          {d.notes && <div style={{ marginTop: 10, fontSize: 11, color: C.text2, fontStyle: "italic", lineHeight: 1.55 }}>📝 {d.notes}</div>}
+        </div>
+      )}
     </div>
   );
 }
@@ -348,7 +522,13 @@ function JeCard({
                   <option value="Cr">Cr</option>
                 </select>
               </td>
-              <td style={{ padding: "5px 8px", textAlign: "right", fontFamily: C.mono, color: C.text2, fontSize: 12, borderBottom: `1px solid ${C.border}`, width: 56 }}>₹ —</td>
+              <td style={{ padding: "5px 4px", textAlign: "right", borderBottom: `1px solid ${C.border}`, width: 92 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 2, justifyContent: "flex-end" }}>
+                  <span style={{ fontSize: 11, color: C.muted }}>₹</span>
+                  <input value={l.amount ?? ""} onChange={(ev) => onPatchLine(l.id, { amount: ev.target.value })} placeholder="—" inputMode="decimal" title="Posting amount (₹L) — auto-fills from an uploaded supporting document" className={EDITABLE}
+                    style={{ width: 64, fontSize: 12, fontFamily: C.mono, textAlign: "right", background: l.amount ? C.accentLt : "transparent", padding: "3px 4px", color: C.text, fontWeight: l.amount ? 700 : 400 }} />
+                </div>
+              </td>
               <td style={{ padding: "5px 6px", borderBottom: `1px solid ${C.border}`, width: 28 }}>
                 <button onClick={() => onRemoveLine(l.id)} title="Remove line" style={{ background: "transparent", border: "none", color: C.muted, cursor: "pointer", fontSize: 12 }}>✕</button>
               </td>
